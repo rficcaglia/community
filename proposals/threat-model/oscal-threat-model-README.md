@@ -66,7 +66,7 @@ Both ATT&CK and ATLAS have python library support for accessing and manipulating
 2.2.2 STIX 2.1
 
 Since [MITRE ATT&CK was already supported in STIX 2.1 collections](https://github.com/mitre-attack/attack-stix-data), and also [ATLAS](https://github.com/mitre-atlas/atlas-navigator-data?tab=readme-ov-file#distributed-files), it was natural to align this model to many of the same concepts and definitions.
-Refer to the [README](./STIX-Modifications-README.md) in this directory for details on which SDOs are used.
+Refer to the [README](./STIX-Modifications-README.md) for details on which SDOs are used.
 
 ### 2.3 Other Solutions Considered
 
@@ -180,6 +180,18 @@ pytm is a python package that allows for "as-code" threat modeling and aligns wi
 to manually or via LLM construct pytm code from the OSCAL threat model output. A future effort might collaborate with pytm and add support for OSCAL.
 
 ## 3. Model Schema
+
+The schema below reflects the actor-centric deduplication design described in §4. Key additions over a naive
+cartesian-product model:
+
+- `threat-actor.capabilities` (§4.3.2) — per-actor capability descriptors that drive the generator's eligibility
+  and non-baseline weight checks.
+- `risk-scenario.actor-capability-modifiers` (§4.3.1) — per-actor P/D/R weight overrides emitted only when an
+  actor's capability produces a value that differs from the 1.0 baseline.
+
+These two fields are the only schema requirements for the deduplication algorithm in §4.4. The concrete P/D/R
+delta values and technique-exclusion gates referenced by the generator are documented in the AC-2 reference table
+(§4.5).
 
 ```json
 {
@@ -430,7 +442,12 @@ to manually or via LLM construct pytm code from the OSCAL threat model output. A
         },
         "description": { "$ref": "#/definitions/MarkupMultilineDatatype" },
         "props": { "type": "array", "items": { "$ref": "#/definitions/property" } },
-        "links": { "type": "array", "items": { "$ref": "#/definitions/link" } }
+        "links": { "type": "array", "items": { "$ref": "#/definitions/link" } },
+        "capabilities": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/actor-capability" },
+          "description": "Actor-specific capabilities that drive deduplication logic: pdr-modifier entries shift P/D/R weights on shared scenarios; reachability entries gate technique access. See §4.3.2 and §4.5."
+        }
       },
       "required": ["uuid", "name", "type"]
     },
@@ -523,6 +540,11 @@ to manually or via LLM construct pytm code from the OSCAL threat model output. A
             "predicted-defender-success-rate": { "$ref": "#/definitions/DecimalDatatype" },
             "actual-defender-success-rate": { "$ref": "#/definitions/DecimalDatatype" }
           }
+        },
+        "actor-capability-modifiers": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/actor-capability-modifier" },
+          "description": "Per-actor P/D/R weight overrides. Only emitted for actors whose capabilities produce non-baseline (≠1.0) weights for this scenario. Actors absent from this array are treated as baseline (1.0 on all dimensions). See §4.3.1 and §4.5."
         }
       },
       "required": ["uuid", "name"]
@@ -536,6 +558,63 @@ to manually or via LLM construct pytm code from the OSCAL threat model output. A
         "links": { "type": "array", "items": { "$ref": "#/definitions/link" } }
       },
       "required": ["uuid", "title"]
+    },
+    "actor-capability": {
+      "title": "Actor Capability",
+      "description": "Describes a single capability possessed by a threat actor that either shifts P/D/R weights on a shared attack-path scenario (affects: prevention|detection|response) or gates access to specific techniques the actor can reach that others cannot (affects: reachability). Used by the generator to avoid the cartesian product anti-pattern — see §4.3.2 and §4.4.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "$ref": "#/definitions/TokenDatatype",
+          "description": "Stable identifier for this capability within the actor record (e.g. 'zero-day-cred-access', 'opsec-discipline')."
+        },
+        "affects": {
+          "type": "string",
+          "enum": ["prevention", "detection", "response", "reachability"],
+          "description": "The dimension this capability modifies. 'reachability' does not carry a numeric modifier; use 'unlocks' to enumerate the technique IDs it makes accessible."
+        },
+        "modifier": {
+          "$ref": "#/definitions/DecimalDatatype",
+          "description": "Additive delta applied to the baseline P/D/R weight (1.0) for affects ∈ {prevention, detection, response}. Negative values degrade the defense (e.g. -0.40 means effective prevention weight = 0.60). Ignored when affects = 'reachability'. Example values are tabulated in §4.5."
+        },
+        "unlocks": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/StringDatatype" },
+          "description": "For affects = 'reachability': MITRE ATT&CK or ATLAS technique IDs this capability makes accessible. Example: insider 'knowledge-of-naming-conventions' unlocks T1036.010 without the enumeration prerequisite edge. Omitted for P/D/R affects types."
+        },
+        "excludes": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/StringDatatype" },
+          "description": "Technique IDs this actor structurally cannot use. The generator calls actor_can_use() and returns False for these. Example: autonomous-agent/misaligned-model cannot use T1621 (MFA fatigue) — no human target. See §4.2 and §4.5."
+        },
+        "rationale": { "$ref": "#/definitions/MarkupMultilineDatatype" }
+      },
+      "required": ["id", "affects"]
+    },
+    "actor-capability-modifier": {
+      "title": "Actor Capability Modifier",
+      "description": "Encodes the per-actor P/D/R weight overrides for a specific risk-scenario. Emitted only when the actor's capabilities produce at least one non-baseline (≠1.0) weight. Actors absent from the scenario's actor-capability-modifiers array are implicitly treated as baseline 1.0 on all three dimensions. Modifiers are multipliers: effective_weight = baseline × modifier. See §4.3.1.",
+      "type": "object",
+      "properties": {
+        "actor-ref": {
+          "$ref": "#/definitions/UUIDDatatype",
+          "description": "UUID of the threat-actor this modifier applies to."
+        },
+        "pdr-weights": {
+          "type": "object",
+          "description": "Multipliers applied to the scenario's baseline P/D/R defense effectiveness for this actor. A value of 1.0 is baseline (omit if baseline to avoid noise). Values below 1.0 indicate the actor makes the defense less effective (e.g., nation-state OPSEC discipline sets detection = 0.40). Values above 1.0 are valid but unusual.",
+          "properties": {
+            "prevention": { "$ref": "#/definitions/DecimalDatatype" },
+            "detection":  { "$ref": "#/definitions/DecimalDatatype" },
+            "response":   { "$ref": "#/definitions/DecimalDatatype" }
+          }
+        },
+        "rationale": {
+          "$ref": "#/definitions/MarkupMultilineDatatype",
+          "description": "Human-readable explanation of why this actor's capabilities shift the weights. Example: 'Nation-state zero-day credential access bypasses preventive controls that rely on known-credential detection; effective prevention weight reduced by 0.40 per §4.5 reference table.'"
+        }
+      },
+      "required": ["actor-ref", "pdr-weights"]
     },
     "import-definition": {
       "type": "object",
@@ -713,13 +792,134 @@ to manually or via LLM construct pytm code from the OSCAL threat model output. A
 }
 ```
 
-## 4. Next Steps
+---
 
-Once the schema proposal is reviewed, refined, corrected and approved we see the roamap steps as follows:
-- implement a python (e.g. trestle) C-R-U-D implementation
-- demonstrate interoperability via tools like OpenCTI
-- create at least 1 real-world open source complete example representing a compliant cloud native (and AI native) system.
-  - For example, we propose to use trestle to generate the complete threat model for SunStone's FedRAMP 20x and CMMC Artemis Platform
-    and open source that threat model for community use. Artemis uses OSCAL as its digital twin platform data model, so it
-    represents both the use of OSCAL threat modeling against a cloud and AI native system and represents a real-world
-    end-to-end OSCAL tooling implementation.
+## 4. Actor-Centric Attack Path Deduplication
+
+### 4.1 Problem: Cartesian Product Anti-Pattern
+
+The naive generator creates scenarios as a cartesian product: `N actors × M techniques = N×M scenarios`, each with a single entry in `threat-actor-refs`. This is wrong.
+
+The **attack path** is defined by the technique and the system state it exploits. Whether a criminal, nation-state, or misaligned agent walks T1078 (Valid Accounts), the path through the system state graph is identical. Generating three separate scenarios for the same path produces redundant risk analysis, inflates scenario counts, and obscures meaningful differentiation.
+
+**Correct model**: one scenario per attack path (technique or technique chain), with `threat-actor-refs` listing all actors who can execute it. Actor-specific capability differences are captured as `actor-capability-modifiers` on the shared scenario — they shift P/D/R weights but do not create new paths unless the actor has access to genuinely different system states.
+
+### 4.2 When an Actor Warrants a Separate Path
+
+A separate scenario is only justified when an actor brings a capability that materially changes the graph structure — specifically:
+
+1. **Different entry state (access position)**: The actor enters the attack graph at a different node, bypassing phases other actors must traverse.
+   - Insider: already authenticated; skips Initial Access; enters at Privilege Escalation or Persistence directly. T1087 (Account Discovery) requires no credential theft prerequisite.
+   - Nation-state: supply chain or pre-positioned access may enter at a state that bypasses CloudTrail (compromised logging pipeline is a different entry state node).
+   - Misaligned agent: holds API credentials scoped to its service role; can invoke IAM actions via its own service principal without external credential theft (unique path for T1098.001).
+
+2. **Technique availability gated by actor**: Some techniques are structurally unavailable to certain actors.
+   - T1621 (MFA Request Generation / fatigue): not available to misaligned agent — no human target to fatigue.
+   - T1556.009 (Conditional Access Bypass): requires IAM-level write access; nation-state and insider have higher reachability; external criminal typically does not.
+   - T1036.010 (Masquerade Account Name): insider knows naming convention directly; external actors must enumerate it first (different prerequisite edge).
+
+3. **P/D/R weight shift only (same path, different weights)**: Most actor differentiation belongs here — the path is the same but edge weights differ based on actor capability. This is not a new scenario; it is an `actor-capability-modifier` on the existing scenario.
+
+### 4.3 Required Schema Additions
+
+#### 4.3.1 `actor-capability-modifier` (new object definition)
+
+Added to `risk-scenario` as an optional array. Emitted only when an actor's capability produces a non-baseline P/D/R weight.
+
+```json
+"actor-capability-modifier": {
+  "type": "object",
+  "properties": {
+    "actor-ref": { "$ref": "#/definitions/UUIDDatatype" },
+    "pdr-weights": {
+      "type": "object",
+      "properties": {
+        "prevention": { "$ref": "#/definitions/DecimalDatatype" },
+        "detection":  { "$ref": "#/definitions/DecimalDatatype" },
+        "response":   { "$ref": "#/definitions/DecimalDatatype" }
+      },
+      "description": "Multipliers applied to baseline P/D/R values for this actor. 1.0 = baseline. Values < 1.0 indicate the actor makes the defense less effective."
+    },
+    "rationale": { "$ref": "#/definitions/MarkupMultilineDatatype" }
+  },
+  "required": ["actor-ref", "pdr-weights"]
+}
+```
+
+Updated `risk-scenario` to include:
+```json
+"actor-capability-modifiers": {
+  "type": "array",
+  "items": { "$ref": "#/definitions/actor-capability-modifier" },
+  "description": "Per-actor P/D/R weight overrides. Only emitted for actors whose capabilities produce non-baseline weights."
+}
+```
+
+#### 4.3.2 `capabilities` array on `threat-actor`
+
+Drives deduplication logic in the generator. Two capability types: `pdr-modifier` (affects weights on shared path) and `access-position` (may unlock a distinct entry state, warranting a new path).
+
+```json
+"actor-capability": {
+  "type": "object",
+  "properties": {
+    "id":       { "$ref": "#/definitions/TokenDatatype" },
+    "affects":  { "type": "string", "enum": ["prevention", "detection", "response", "reachability"] },
+    "modifier": { "$ref": "#/definitions/DecimalDatatype",
+                  "description": "For pdr affects: additive delta applied to baseline weight. For reachability: ignored." },
+    "unlocks":  { "type": "array", "items": { "$ref": "#/definitions/StringDatatype" },
+                  "description": "For reachability: technique IDs this capability makes accessible to the actor." }
+  },
+  "required": ["id", "affects"]
+}
+```
+
+`threat-actor` gains:
+```json
+"capabilities": {
+  "type": "array",
+  "items": { "$ref": "#/definitions/actor-capability" }
+}
+```
+
+### 4.4 Generator Logic
+
+Replace the cartesian product loop with a technique-centric loop:
+
+```python
+for technique in techniques:
+    eligible_actors = [a for a in actors if actor_can_use(a, technique)]
+    if not eligible_actors:
+        continue
+    modifiers = [
+        capability_modifier(a, technique)
+        for a in eligible_actors
+        if has_non_baseline_capability(a, technique)
+    ]
+    scenarios.append(build_scenario(eligible_actors, technique, modifiers))
+```
+
+- `actor_can_use(actor, technique)`: returns `False` if the technique requires access or conditions the actor structurally cannot satisfy (e.g., T1621 for `autonomous-agent` / `misaligned-model` types).
+- `has_non_baseline_capability(actor, technique)`: returns `True` only when the actor's capabilities produce a P/D/R modifier that differs from 1.0 for this technique.
+- `build_scenario(actors, technique, modifiers)`: emits one scenario with `threat-actor-refs` listing all eligible actors and `actor-capability-modifiers` for those with non-baseline weights.
+
+This collapses `N×M` scenarios to `M` (or fewer, where some actors cannot use a technique), with per-actor P/D/R differentiation preserved in the modifier array.
+
+### 4.5 Actor Capability Reference Table (AC-2 / IAM Domain)
+
+| Actor | Type | Capability | Affects | P modifier | D modifier | R modifier |
+|---|---|---|---|---|---|---|
+| Nation-State | `nation-state` | Zero-day credential access | prevention | -0.40 | — | — |
+| Nation-State | `nation-state` | OPSEC discipline | detection | — | -0.60 | — |
+| Nation-State | `nation-state` | Supply chain pre-position | reachability | — | — | — |
+| Misaligned Agent | `autonomous-agent` | Machine-speed API replay | detection | — | -0.70 | — |
+| Misaligned Agent | `autonomous-agent` | Automated re-entry | response | — | — | -0.50 |
+| Insider | `insider` | Legitimate credential possession | prevention | -0.30 | -0.40 | — |
+| Insider | `insider` | Knowledge of naming conventions | reachability (T1036.010 prereq skipped) | — | — | — |
+| Criminal | `criminal` | Baseline external attacker | — | 1.0 | 1.0 | 1.0 |
+
+Technique availability gates:
+- T1621 (MFA fatigue): not available to `autonomous-agent`, `misaligned-model`, `m2m-process`
+- T1556.009 (Conditional Access Bypass): not available to `criminal` (requires IAM write; external attacker assumed not to have it without prior privilege escalation)
+- T1036.010 (Masquerade Account Name): insider skips enumeration prerequisite edge
+```
